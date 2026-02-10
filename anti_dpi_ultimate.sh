@@ -15,7 +15,9 @@
 #    Layer 6 (Xray):        TLS fragment + uTLS + Reality SNI
 # ============================================================================
 
-set -euo pipefail
+set -uo pipefail
+# NOTE: set -e intentionally NOT used — nft/iptables/tc commands may fail
+# on older kernels and we handle errors per-function with || true guards.
 
 # ============================================================================
 # SECTION 1: CONSTANTS & LOGGING
@@ -243,30 +245,38 @@ nft_apply_rst_suppression() {
     nft add chain inet "${NFT_TABLE_RAW}" output_raw \
         '{ type filter hook output priority -300; policy accept; }'
 
-    # Drop RST we generate on Trojan port (Iran outbound to foreign)
-    nft add rule inet "${NFT_TABLE_RAW}" output_raw \
-        tcp dport "${PORT_TROJAN}" tcp flags '&' '(rst)' == rst drop
+    # Only block RST during handshake (SYN_SENT/SYN_RECV) where DPI injects forged RSTs.
+    # Allow RST on established connections for proper TCP teardown (prevents half-open leak).
+    # We use ct state to distinguish — but for NOTRACK'd flows, we use a rate-limit approach.
 
-    # Drop RST we generate on VLESS port
+    # Outgoing RST suppression: only when no established conntrack entry
     nft add rule inet "${NFT_TABLE_RAW}" output_raw \
-        tcp dport "${PORT_VLESS}" tcp flags '&' '(rst)' == rst drop
+        tcp dport "${PORT_TROJAN}" tcp flags '&' '(rst)' == rst \
+        ct state new,untracked drop 2>/dev/null || \
+    nft add rule inet "${NFT_TABLE_RAW}" output_raw \
+        tcp dport "${PORT_TROJAN}" tcp flags '&' '(rst)' == rst \
+        limit rate 5/second accept 2>/dev/null || true
+    nft add rule inet "${NFT_TABLE_RAW}" output_raw \
+        tcp dport "${PORT_TROJAN}" tcp flags '&' '(rst|syn)' == rst drop 2>/dev/null || true
 
-    # Also suppress RST from sport (server responding)
     nft add rule inet "${NFT_TABLE_RAW}" output_raw \
-        tcp sport "${PORT_TROJAN}" tcp flags '&' '(rst)' == rst drop
+        tcp sport "${PORT_TROJAN}" tcp flags '&' '(rst|syn)' == rst \
+        ct state new,untracked drop 2>/dev/null || true
     nft add rule inet "${NFT_TABLE_RAW}" output_raw \
-        tcp sport "${PORT_VLESS}" tcp flags '&' '(rst)' == rst drop
+        tcp sport "${PORT_VLESS}" tcp flags '&' '(rst|syn)' == rst \
+        ct state new,untracked drop 2>/dev/null || true
 
     if [[ "${NODE_ROLE}" == "iran" ]]; then
-        # Input chain: drop INCOMING forged RSTs from DPI on established connections
+        # Input chain: drop INCOMING forged RSTs from DPI
+        # Only block bare RST (not RST+ACK which is legitimate teardown)
         nft add chain inet "${NFT_TABLE_RAW}" input_raw \
-            '{ type filter hook input priority -300; policy accept; }'
+            '{ type filter hook input priority -300; policy accept; }' 2>/dev/null || true
 
-        # DPI sends RST to kill our connections — drop them
+        # DPI sends bare RST to kill our connections during handshake
         nft add rule inet "${NFT_TABLE_RAW}" input_raw \
-            tcp sport "${PORT_TROJAN}" tcp flags '&' '(rst)' == rst drop
+            tcp sport "${PORT_TROJAN}" tcp flags '&' '(rst|ack)' == rst drop 2>/dev/null || true
         nft add rule inet "${NFT_TABLE_RAW}" input_raw \
-            tcp dport "${PORT_TROJAN}" tcp flags '&' '(rst)' == rst drop
+            tcp dport "${PORT_TROJAN}" tcp flags '&' '(rst|ack)' == rst drop 2>/dev/null || true
     fi
 
     log_info "RST suppression: ACTIVE (ports ${PORT_TROJAN}, ${PORT_VLESS})"
@@ -288,25 +298,34 @@ nft_apply_conntrack_bypass() {
     nft add chain inet "${NFT_TABLE_CT}" output_raw \
         '{ type filter hook output priority -300; policy accept; }'
 
-    # NOTRACK for WireGuard UDP traffic (both directions)
-    nft add rule inet "${NFT_TABLE_CT}" prerouting_raw \
-        udp dport "${PORT_WG}" notrack
-    nft add rule inet "${NFT_TABLE_CT}" output_raw \
-        udp dport "${PORT_WG}" notrack
-    nft add rule inet "${NFT_TABLE_CT}" prerouting_raw \
-        udp sport "${PORT_WG}" notrack
-    nft add rule inet "${NFT_TABLE_CT}" output_raw \
-        udp sport "${PORT_WG}" notrack
+    # NOTRACK for WireGuard UDP — BUT only if no NAT/MASQUERADE depends on conntrack.
+    # Check if MASQUERADE rules exist for the WireGuard interface first.
+    local wg_has_nat=false
+    if iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -q "MASQUERADE.*wg0\|SNAT.*wg0" || \
+       iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -q "MASQUERADE.*51820"; then
+        wg_has_nat=true
+    fi
+
+    if [[ "${wg_has_nat}" == false ]]; then
+        nft add rule inet "${NFT_TABLE_CT}" prerouting_raw \
+            udp dport "${PORT_WG}" notrack 2>/dev/null || true
+        nft add rule inet "${NFT_TABLE_CT}" output_raw \
+            udp dport "${PORT_WG}" notrack 2>/dev/null || true
+        nft add rule inet "${NFT_TABLE_CT}" prerouting_raw \
+            udp sport "${PORT_WG}" notrack 2>/dev/null || true
+        nft add rule inet "${NFT_TABLE_CT}" output_raw \
+            udp sport "${PORT_WG}" notrack 2>/dev/null || true
+        log_info "Conntrack bypass: WG NOTRACK active (no NAT detected)"
+    else
+        log_warn "Conntrack bypass: WG skipped (NAT/MASQUERADE detected — NOTRACK would break it)"
+    fi
 
     if [[ "${NODE_ROLE}" == "iran" ]]; then
         # NOTRACK for Xray-marked traffic (mark 0xff set by Xray sockopt)
         nft add rule inet "${NFT_TABLE_CT}" output_raw \
-            meta mark "${XRAY_MARK}" notrack
+            meta mark "${XRAY_MARK}" notrack 2>/dev/null || true
+        log_info "Conntrack bypass: Xray mark NOTRACK active"
     fi
-
-    log_info "Conntrack bypass: ACTIVE (WG:${PORT_WG}$(
-        [[ "${NODE_ROLE}" == "iran" ]] && echo ", Xray mark:0xff"
-    ))"
 }
 
 # ── 4.3 MSS Clamping (enhanced multi-stage, GFK-inspired) ───────────────────
@@ -370,20 +389,30 @@ nft_apply_fingerprint_normalize() {
     nft add chain inet "${NFT_TABLE_MANGLE}" output_mangle \
         '{ type route hook output priority -150; policy accept; }' 2>/dev/null || true
 
-    # TTL normalization to 64 (Linux/Chrome default)
+    # TTL normalization to 64 (Linux/Chrome default) — IPv4
     nft add rule inet "${NFT_TABLE_MANGLE}" output_mangle \
-        oifname "${PRIMARY_IFACE}" ip ttl set 64
+        oifname "${PRIMARY_IFACE}" ip ttl set 64 2>/dev/null || true
+
+    # IPv6 hop limit normalization to 64
+    nft add rule inet "${NFT_TABLE_MANGLE}" output_mangle \
+        oifname "${PRIMARY_IFACE}" ip6 hoplimit set 64 2>/dev/null || true
 
     if [[ "${NODE_ROLE}" == "iran" ]]; then
-        # On Iran node: also normalize TTL for tunnel-specific traffic
+        # On Iran node: also normalize TTL/hoplimit for tunnel-specific traffic
         nft add rule inet "${NFT_TABLE_MANGLE}" output_mangle \
-            meta mark "${XRAY_MARK}" ip ttl set 64
+            meta mark "${XRAY_MARK}" ip ttl set 64 2>/dev/null || true
+        nft add rule inet "${NFT_TABLE_MANGLE}" output_mangle \
+            meta mark "${XRAY_MARK}" ip6 hoplimit set 64 2>/dev/null || true
+
+        # Zero DSCP/TOS to prevent traffic classification fingerprinting
+        nft add rule inet "${NFT_TABLE_MANGLE}" output_mangle \
+            meta mark "${XRAY_MARK}" ip dscp set 0 2>/dev/null || true
     fi
 
     # TCP timestamps disabled via sysctl (more reliable than per-packet stripping)
     # Done in apply_sysctl_ultimate()
 
-    log_info "Fingerprint normalization: ACTIVE (TTL=64, timestamps=sysctl)"
+    log_info "Fingerprint normalization: ACTIVE (TTL/hoplimit=64, DSCP=0, timestamps=sysctl)"
 }
 
 # ── 4.5 ICMP Hardening ──────────────────────────────────────────────────────
@@ -414,9 +443,13 @@ nft_apply_icmp_hardening() {
     nft add rule inet "${NFT_TABLE_FILTER}" output_filter \
         icmp type address-mask-reply drop 2>/dev/null || true
 
-    # Block outgoing destination-unreachable (leaks topology)
+    # Rate-limit outgoing destination-unreachable instead of blocking entirely.
+    # Full block causes PMTU black holes; rate-limit reduces topology leak while
+    # keeping PMTU discovery functional.
     nft add rule inet "${NFT_TABLE_FILTER}" output_filter \
-        icmp type destination-unreachable drop
+        icmp type destination-unreachable limit rate 10/second accept 2>/dev/null || true
+    nft add rule inet "${NFT_TABLE_FILTER}" output_filter \
+        icmp type destination-unreachable drop 2>/dev/null || true
 
     # Rate limit echo-request (prevent ping-based tunnel detection)
     nft add rule inet "${NFT_TABLE_FILTER}" input_filter \
@@ -443,16 +476,23 @@ nft_apply_rate_limiting() {
     nft add chain inet "${NFT_TABLE_FILTER}" input_filter \
         '{ type filter hook input priority 0; policy accept; }' 2>/dev/null || true
 
-    # Limit new SYN connections per source IP on tunnel ports
+    # Per-source-IP SYN rate limiting using nftables meter (set with per-IP counters)
+    # Prevents a single IP from DoS-ing the port while allowing legitimate users through
     nft add rule inet "${NFT_TABLE_FILTER}" input_filter \
         tcp dport "${PORT_TROJAN}" tcp flags '&' '(syn)' == syn \
-        limit rate over 100/second drop
+        meter syn_trojan '{ ip saddr limit rate over 20/second }' drop 2>/dev/null || \
+    nft add rule inet "${NFT_TABLE_FILTER}" input_filter \
+        tcp dport "${PORT_TROJAN}" tcp flags '&' '(syn)' == syn \
+        limit rate over 500/second drop 2>/dev/null || true
 
     nft add rule inet "${NFT_TABLE_FILTER}" input_filter \
         tcp dport "${PORT_VLESS}" tcp flags '&' '(syn)' == syn \
-        limit rate over 100/second drop
+        meter syn_vless '{ ip saddr limit rate over 20/second }' drop 2>/dev/null || \
+    nft add rule inet "${NFT_TABLE_FILTER}" input_filter \
+        tcp dport "${PORT_VLESS}" tcp flags '&' '(syn)' == syn \
+        limit rate over 500/second drop 2>/dev/null || true
 
-    log_info "Rate limiting: ACTIVE (100 SYN/sec per port)"
+    log_info "Rate limiting: ACTIVE (20 SYN/sec per-IP, 500/sec global fallback)"
 }
 
 # ============================================================================
@@ -490,23 +530,23 @@ ipt_flush_antidpi() {
 ipt_apply_rst_suppression() {
     log_step "Applying RST suppression (iptables raw)..."
 
-    # Create output raw chain
+    # Create output raw chain — only block bare RST (not RST+ACK for clean teardown)
     iptables -t raw -N ANTIDPI_RAW_OUT 2>/dev/null || iptables -t raw -F ANTIDPI_RAW_OUT
-    iptables -t raw -A ANTIDPI_RAW_OUT -p tcp --dport "${PORT_TROJAN}" --tcp-flags RST RST -j DROP
-    iptables -t raw -A ANTIDPI_RAW_OUT -p tcp --dport "${PORT_VLESS}" --tcp-flags RST RST -j DROP
-    iptables -t raw -A ANTIDPI_RAW_OUT -p tcp --sport "${PORT_TROJAN}" --tcp-flags RST RST -j DROP
-    iptables -t raw -A ANTIDPI_RAW_OUT -p tcp --sport "${PORT_VLESS}" --tcp-flags RST RST -j DROP
+    # Drop bare RST (without ACK) — these are DPI-injected
+    iptables -t raw -A ANTIDPI_RAW_OUT -p tcp --dport "${PORT_TROJAN}" --tcp-flags RST,ACK RST -j DROP 2>/dev/null || true
+    iptables -t raw -A ANTIDPI_RAW_OUT -p tcp --sport "${PORT_TROJAN}" --tcp-flags RST,ACK RST -j DROP 2>/dev/null || true
+    iptables -t raw -A ANTIDPI_RAW_OUT -p tcp --sport "${PORT_VLESS}" --tcp-flags RST,ACK RST -j DROP 2>/dev/null || true
     iptables -t raw -A OUTPUT -j ANTIDPI_RAW_OUT
 
     if [[ "${NODE_ROLE}" == "iran" ]]; then
-        # Drop incoming forged RSTs
+        # Drop incoming forged bare RSTs from DPI
         iptables -t raw -N ANTIDPI_RAW_IN 2>/dev/null || iptables -t raw -F ANTIDPI_RAW_IN
-        iptables -t raw -A ANTIDPI_RAW_IN -p tcp --sport "${PORT_TROJAN}" --tcp-flags RST RST -j DROP
-        iptables -t raw -A ANTIDPI_RAW_IN -p tcp --dport "${PORT_TROJAN}" --tcp-flags RST RST -j DROP
+        iptables -t raw -A ANTIDPI_RAW_IN -p tcp --sport "${PORT_TROJAN}" --tcp-flags RST,ACK RST -j DROP 2>/dev/null || true
+        iptables -t raw -A ANTIDPI_RAW_IN -p tcp --dport "${PORT_TROJAN}" --tcp-flags RST,ACK RST -j DROP 2>/dev/null || true
         iptables -t raw -A PREROUTING -j ANTIDPI_RAW_IN
     fi
 
-    log_info "RST suppression: ACTIVE [iptables]"
+    log_info "RST suppression: ACTIVE [iptables] (bare RST only, RST+ACK allowed)"
 }
 
 ipt_apply_conntrack_bypass() {
@@ -574,7 +614,8 @@ ipt_apply_icmp_hardening() {
     iptables -A ANTIDPI_ICMP -p icmp --icmp-type timestamp-request -j DROP
     iptables -A ANTIDPI_ICMP -p icmp --icmp-type timestamp-reply -j DROP
 
-    # Block destination unreachable outgoing
+    # Rate-limit destination unreachable outgoing (don't fully block — breaks PMTU)
+    iptables -A OUTPUT -p icmp --icmp-type destination-unreachable -m limit --limit 10/s -j ACCEPT 2>/dev/null || true
     iptables -A OUTPUT -p icmp --icmp-type destination-unreachable -j DROP 2>/dev/null || true
 
     # Rate limit echo
@@ -616,8 +657,15 @@ tc_detect_bandwidth() {
     fi
 
     # Default fallback
-    if [[ -z "${speed}" || "${speed}" == "Unknown!" ]]; then
-        speed="1000Mb/s"
+    if [[ -z "${speed}" || "${speed}" == "Unknown!" || "${speed}" == *"base"* ]]; then
+        # Try extracting just the number from formats like "10000baseT/Full"
+        local num_only
+        num_only=$(echo "${speed}" | grep -o '^[0-9]*')
+        if [[ -n "${num_only}" && "${num_only}" -gt 0 ]] 2>/dev/null; then
+            speed="${num_only}Mb/s"
+        else
+            speed="1000Mb/s"
+        fi
     fi
 
     # Convert to tc format
@@ -642,39 +690,59 @@ tc_apply_traffic_shaping() {
     # HTB root qdisc
     tc qdisc add dev "${PRIMARY_IFACE}" root handle 1: htb default 30
 
-    # Root class
-    tc class add dev "${PRIMARY_IFACE}" parent 1: classid 1:1 \
-        htb rate "${bandwidth}" burst 256k cburst 256k
-
-    # Tunnel traffic class (priority, 80% guaranteed bandwidth)
-    local tunnel_rate
-    tunnel_rate=$(echo "${bandwidth}" | sed 's/[0-9]*//' | xargs -I{} echo "$(echo "${bandwidth}" | grep -o '[0-9]*' | head -1)"{})
-    # Simplified: use 80% of detected bandwidth
+    # Parse bandwidth value and unit
     local rate_num
-    rate_num=$(echo "${bandwidth}" | grep -o '[0-9]*' | head -1)
+    rate_num=$(echo "${bandwidth}" | grep -o '^[0-9]*')
     local rate_unit
-    rate_unit=$(echo "${bandwidth}" | sed 's/[0-9]*//')
+    rate_unit=$(echo "${bandwidth}" | sed 's/^[0-9]*//')
     local tunnel_bw="$(( rate_num * 80 / 100 ))${rate_unit}"
     local other_bw="$(( rate_num * 20 / 100 ))${rate_unit}"
 
+    # Calculate burst size for high-speed links:
+    # burst >= rate_bytes_per_sec * 0.001 (1ms timer resolution)
+    # For 10gbit: 10000/8 * 0.001 = 1.25MB minimum. Use 10MB for headroom.
+    local burst_size="256k"
+    local tunnel_burst="128k"
+    if [[ ${rate_num} -ge 10000 ]]; then
+        # 10Gbps+
+        burst_size="10m"
+        tunnel_burst="8m"
+    elif [[ ${rate_num} -ge 1000 ]]; then
+        # 1Gbps+
+        burst_size="2m"
+        tunnel_burst="1600k"
+    fi
+
+    # Root class — full link bandwidth with appropriate burst
+    tc class add dev "${PRIMARY_IFACE}" parent 1: classid 1:1 \
+        htb rate "${bandwidth}" burst "${burst_size}" cburst "${burst_size}"
+
+    # Tunnel traffic class (priority, 80% guaranteed, can burst to 100%)
     tc class add dev "${PRIMARY_IFACE}" parent 1:1 classid 1:10 \
-        htb rate "${tunnel_bw}" ceil "${bandwidth}" burst 128k cburst 128k prio 1
+        htb rate "${tunnel_bw}" ceil "${bandwidth}" burst "${tunnel_burst}" cburst "${tunnel_burst}" prio 1
 
+    # Other traffic class
     tc class add dev "${PRIMARY_IFACE}" parent 1:1 classid 1:30 \
-        htb rate "${other_bw}" ceil "${bandwidth}" burst 64k prio 3
+        htb rate "${other_bw}" ceil "${bandwidth}" burst 256k prio 3
 
-    # fq_codel on tunnel class (low latency + fairness)
+    # fq on tunnel class — BBR works best with fq (per-flow pacing), not fq_codel
+    # fq_codel provides AQM but lacks the pacing BBR relies on
+    local fq_limit=32768
+    [[ ${rate_num} -ge 10000 ]] && fq_limit=65536
+    tc qdisc add dev "${PRIMARY_IFACE}" parent 1:10 handle 10: fq \
+        limit "${fq_limit}" flow_limit 256 2>/dev/null || \
     tc qdisc add dev "${PRIMARY_IFACE}" parent 1:10 handle 10: fq_codel \
-        limit 10240 target 5ms interval 100ms ecn
+        limit "${fq_limit}" target 5ms interval 100ms ecn
 
-    # fq on default class
-    tc qdisc add dev "${PRIMARY_IFACE}" parent 1:30 handle 30: fq 2>/dev/null || \
-        tc qdisc add dev "${PRIMARY_IFACE}" parent 1:30 handle 30: fq_codel
+    # fq_codel on default class (non-tunnel traffic)
+    tc qdisc add dev "${PRIMARY_IFACE}" parent 1:30 handle 30: fq_codel \
+        limit 10240 target 5ms interval 100ms ecn 2>/dev/null || true
 
-    # Classify tunnel traffic by mark
+    # Classify tunnel traffic by mark (IPv4 + IPv6)
     tc filter add dev "${PRIMARY_IFACE}" parent 1: protocol ip handle "${XRAY_MARK}" fw classid 1:10
+    tc filter add dev "${PRIMARY_IFACE}" parent 1: protocol ipv6 handle "${XRAY_MARK}" fw classid 1:10 2>/dev/null || true
 
-    # Classify by port
+    # Classify by port (IPv4)
     tc filter add dev "${PRIMARY_IFACE}" parent 1: protocol ip \
         u32 match ip dport "${PORT_TROJAN}" 0xffff classid 1:10
     tc filter add dev "${PRIMARY_IFACE}" parent 1: protocol ip \
@@ -684,7 +752,7 @@ tc_apply_traffic_shaping() {
     tc filter add dev "${PRIMARY_IFACE}" parent 1: protocol ip \
         u32 match ip sport "${PORT_VLESS}" 0xffff classid 1:10
 
-    log_info "Traffic shaping: ACTIVE (HTB + fq_codel, tunnel=${tunnel_bw})"
+    log_info "Traffic shaping: ACTIVE (HTB + fq, tunnel=${tunnel_bw}, burst=${tunnel_burst})"
 }
 
 tc_apply_wg_qdisc() {
@@ -694,11 +762,11 @@ tc_apply_wg_qdisc() {
 
     log_step "Applying WireGuard interface optimization..."
 
-    # fq on wg0 for BBR compatibility
+    # fq on wg0 for BBR compatibility + appropriate queue length for high-speed
     if ip link show wg0 &>/dev/null; then
         tc qdisc replace dev wg0 root fq 2>/dev/null || true
-        ip link set wg0 txqueuelen 4000 2>/dev/null || true
-        log_info "WireGuard qdisc: fq (txqueuelen=4000)"
+        ip link set wg0 txqueuelen 10000 2>/dev/null || true
+        log_info "WireGuard qdisc: fq (txqueuelen=10000)"
     else
         log_skip "WireGuard interface wg0 not found"
     fi
@@ -757,8 +825,12 @@ net.ipv4.tcp_fastopen = 3
 # ── Anti-Fingerprint ──
 # Timestamps leak uptime + enable per-flow tracking
 net.ipv4.tcp_timestamps = 0
-# PMTU discovery generates ICMP that reveals tunnel topology
-net.ipv4.ip_no_pmtu_disc = 1
+# PMTU discovery: use kernel-based PMTU (no ICMP needed) instead of full disable.
+# Full disable (=1) causes black holes on 10Gbps links with varying MTU paths.
+# Value 2 = use interface MTU as initial, kernel tracks PMTU without ICMP
+net.ipv4.ip_no_pmtu_disc = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_base_mss = 1024
 # Active ECN is a fingerprint; passive responds only if peer initiates
 net.ipv4.tcp_ecn = 2
 # Slow start restart creates distinctive traffic pattern after pauses
@@ -766,15 +838,16 @@ net.ipv4.tcp_slow_start_after_idle = 0
 # Window scaling (needed for BBR, matches browser behavior)
 net.ipv4.tcp_window_scaling = 1
 
-# ── Socket Buffers (BBR optimal, matches browser profile) ──
+# ── Socket Buffers (BBR optimal for 10Gbps) ──
 net.core.rmem_default = 2097152
-net.core.rmem_max = 33554432
+net.core.rmem_max = 67108864
 net.core.wmem_default = 2097152
-net.core.wmem_max = 33554432
-net.ipv4.tcp_rmem = 8192 2097152 33554432
-net.ipv4.tcp_wmem = 8192 2097152 33554432
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 8192 2097152 67108864
+net.ipv4.tcp_wmem = 8192 2097152 67108864
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.core.optmem_max = 81920
 
 # ── Connection Management ──
 net.core.somaxconn = 65535
@@ -799,9 +872,10 @@ net.ipv4.ip_local_port_range = 1024 65535
 fs.file-max = 2097152
 fs.nr_open = 2097152
 
-# ── TCP/UDP Memory ──
-net.ipv4.tcp_mem = 65536 131072 262144
-net.ipv4.udp_mem = 65536 131072 262144
+# ── TCP/UDP Memory (pages, 4KB each) ──
+# For 10Gbps: low=1GB, pressure=2GB, hard=4GB
+net.ipv4.tcp_mem = 262144 524288 1048576
+net.ipv4.udp_mem = 262144 524288 1048576
 
 # ── Conntrack ──
 net.netfilter.nf_conntrack_max = 262144
@@ -831,7 +905,11 @@ vm.swappiness = 10
 vm.dirty_ratio = 15
 vm.dirty_background_ratio = 5
 vm.vfs_cache_pressure = 50
-vm.min_free_kbytes = 65536
+vm.min_free_kbytes = 131072
+
+# ── NAPI / Network Polling (10Gbps) ──
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 8000
 
 # ── ARP Cache ──
 net.ipv4.neigh.default.gc_thresh1 = 512
@@ -843,6 +921,98 @@ SYSCTL
     sysctl --system > /dev/null 2>&1
 
     log_info "Kernel hardening: $(grep -c '=' "${SYSCTL_CONF}") parameters applied"
+}
+
+# ============================================================================
+# SECTION 7.5: NIC HARDWARE OPTIMIZATION (10Gbps)
+# ============================================================================
+
+apply_nic_optimization() {
+    log_step "Applying NIC hardware optimization..."
+
+    # Enable hardware offloads — critical for 10Gbps to reduce CPU overhead
+    if [[ "${HAS_ETHTOOL}" == true ]]; then
+        # GRO/GSO/TSO on physical interface
+        ethtool -K "${PRIMARY_IFACE}" gro on 2>/dev/null || true
+        ethtool -K "${PRIMARY_IFACE}" gso on 2>/dev/null || true
+        ethtool -K "${PRIMARY_IFACE}" tso on 2>/dev/null || true
+        ethtool -K "${PRIMARY_IFACE}" tx on 2>/dev/null || true
+        ethtool -K "${PRIMARY_IFACE}" rx on 2>/dev/null || true
+        log_info "NIC offloads: GRO/GSO/TSO enabled"
+
+        # Maximize NIC ring buffer
+        ethtool -G "${PRIMARY_IFACE}" rx 4096 tx 4096 2>/dev/null || true
+        log_info "NIC ring buffer: maximized"
+
+        # Adaptive interrupt coalescing
+        ethtool -C "${PRIMARY_IFACE}" adaptive-rx on adaptive-tx on 2>/dev/null || \
+        ethtool -C "${PRIMARY_IFACE}" rx-usecs 50 tx-usecs 50 2>/dev/null || true
+        log_info "NIC interrupt coalescing: adaptive"
+    fi
+
+    # GRO/GSO on WireGuard interface
+    if ip link show wg0 &>/dev/null; then
+        ethtool -K wg0 gro on 2>/dev/null || true
+        ethtool -K wg0 gso on 2>/dev/null || true
+    fi
+
+    # RPS/XPS multi-core packet steering
+    local num_cpus
+    num_cpus=$(nproc 2>/dev/null || echo 4)
+    local rps_mask
+    # Calculate hex bitmask for all CPUs (e.g., 4 CPUs = 0xf, 8 = 0xff, 16 = 0xffff)
+    rps_mask=$(printf '%x' $(( (1 << num_cpus) - 1 )))
+
+    # Apply RPS to all RX queues
+    local queue_dir="/sys/class/net/${PRIMARY_IFACE}/queues"
+    if [[ -d "${queue_dir}" ]]; then
+        for rxq in "${queue_dir}"/rx-*; do
+            [[ -d "${rxq}" ]] && echo "${rps_mask}" > "${rxq}/rps_cpus" 2>/dev/null || true
+        done
+        # Apply XPS to all TX queues
+        for txq in "${queue_dir}"/tx-*; do
+            [[ -d "${txq}" ]] && echo "${rps_mask}" > "${txq}/xps_cpus" 2>/dev/null || true
+        done
+        log_info "RPS/XPS: enabled for ${num_cpus} CPUs (mask: 0x${rps_mask})"
+    fi
+
+    # RFS (Receive Flow Steering)
+    local rfs_entries=$(( num_cpus * 8192 ))
+    echo "${rfs_entries}" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+    local rx_count
+    rx_count=$(ls -d "${queue_dir}"/rx-* 2>/dev/null | wc -l)
+    if [[ ${rx_count} -gt 0 ]]; then
+        local per_queue=$(( rfs_entries / rx_count ))
+        for rxq in "${queue_dir}"/rx-*/rps_flow_cnt; do
+            [[ -f "${rxq}" ]] && echo "${per_queue}" > "${rxq}" 2>/dev/null || true
+        done
+    fi
+
+    # ulimit for current session and limits.conf
+    ulimit -n 1048576 2>/dev/null || true
+    if ! grep -q 'antidpi-ultimate' /etc/security/limits.conf 2>/dev/null; then
+        cat >> /etc/security/limits.conf << 'LIMITS'
+# antidpi-ultimate: high FD limits for tunnel traffic
+*    soft    nofile    1048576
+*    hard    nofile    1048576
+root soft    nofile    1048576
+root hard    nofile    1048576
+*    soft    nproc     65535
+*    hard    nproc     65535
+LIMITS
+        log_info "ulimits: 1M file descriptors configured"
+    fi
+
+    # TCP initial window optimization for 10Gbps
+    # IW=42 (approx 64KB) matches Chrome behavior and improves 10Gbps throughput
+    local default_route
+    default_route=$(ip route show default | head -1)
+    if [[ -n "${default_route}" ]]; then
+        ip route change ${default_route} initcwnd 42 initrwnd 42 2>/dev/null || true
+        log_info "TCP initial window: initcwnd=42, initrwnd=42"
+    fi
+
+    log_info "NIC optimization: complete"
 }
 
 # ============================================================================
@@ -900,8 +1070,11 @@ patch_xray_fingerprint() {
 
     # Set fingerprint to "chrome" (dominant browser in Iran)
     # "randomized" is suspicious — no real browser changes fingerprint per connection
-    if jq '(.inbounds[].streamSettings.tlsSettings.fingerprint) |= "chrome" |
-           (.outbounds[].streamSettings.tlsSettings.fingerprint) |= "chrome"' \
+    # Use select() to only patch entries that actually have tlsSettings (avoids null injection)
+    if jq '(.inbounds[] | select(.streamSettings.tlsSettings != null) |
+            .streamSettings.tlsSettings.fingerprint) |= "chrome" |
+           (.outbounds[] | select(.streamSettings.tlsSettings != null) |
+            .streamSettings.tlsSettings.fingerprint) |= "chrome"' \
         "${XRAY_CONFIG}" > "${tmp}" 2>/dev/null; then
         mv "${tmp}" "${XRAY_CONFIG}"
         log_info "uTLS fingerprint: set to chrome"
@@ -1036,10 +1209,10 @@ run_dpi_self_test() {
     ts=$(sysctl -n net.ipv4.tcp_timestamps 2>/dev/null)
     if [[ "${ts}" == "0" ]]; then
         log_ok "TCP timestamps: DISABLED"
-        ((pass++))
+        pass=$((pass + 1))
     else
         log_fail "TCP timestamps: ENABLED (fingerprint risk!)"
-        ((fail++))
+        fail=$((fail + 1))
     fi
 
     # 2. TTL normalization
@@ -1051,10 +1224,10 @@ run_dpi_self_test() {
     fi
     if [[ "${ttl_active}" == true ]]; then
         log_ok "TTL normalization: ACTIVE (64)"
-        ((pass++))
+        pass=$((pass + 1))
     else
         log_fail "TTL normalization: INACTIVE"
-        ((fail++))
+        fail=$((fail + 1))
     fi
 
     # 3. RST suppression
@@ -1066,10 +1239,10 @@ run_dpi_self_test() {
     fi
     if [[ "${rst_active}" == true ]]; then
         log_ok "RST suppression: ACTIVE"
-        ((pass++))
+        pass=$((pass + 1))
     else
         log_fail "RST suppression: INACTIVE"
-        ((fail++))
+        fail=$((fail + 1))
     fi
 
     # 4. MSS clamping
@@ -1081,13 +1254,13 @@ run_dpi_self_test() {
     fi
     if [[ "${mss_active}" == true ]]; then
         log_ok "MSS clamping: ACTIVE"
-        ((pass++))
+        pass=$((pass + 1))
     elif [[ "${NODE_ROLE}" == "foreign" ]]; then
         log_skip "MSS clamping: N/A (foreign node)"
-        ((pass++))
+        pass=$((pass + 1))
     else
         log_fail "MSS clamping: INACTIVE"
-        ((fail++))
+        fail=$((fail + 1))
     fi
 
     # 5. WireGuard qdisc
@@ -1095,13 +1268,13 @@ run_dpi_self_test() {
     wg_qdisc=$(tc qdisc show dev wg0 2>/dev/null | head -1)
     if [[ "${wg_qdisc}" == *"fq"* ]]; then
         log_ok "WireGuard qdisc: fq"
-        ((pass++))
+        pass=$((pass + 1))
     elif ip link show wg0 &>/dev/null; then
         log_fail "WireGuard qdisc: ${wg_qdisc:-none}"
-        ((fail++))
+        fail=$((fail + 1))
     else
         log_skip "WireGuard: interface not up"
-        ((pass++))
+        pass=$((pass + 1))
     fi
 
     # 6. Xray fragment config
@@ -1109,24 +1282,24 @@ run_dpi_self_test() {
         local frag_int
         frag_int=$(jq -r '.outbounds[] | select(.settings.fragment) | .settings.fragment.interval' "${XRAY_CONFIG}" 2>/dev/null)
         log_ok "Xray TLS fragment: interval=${frag_int}"
-        ((pass++))
+        pass=$((pass + 1))
     elif [[ "${NODE_ROLE}" == "foreign" ]]; then
         log_skip "Xray fragment: N/A (foreign node)"
-        ((pass++))
+        pass=$((pass + 1))
     else
         log_fail "Xray TLS fragment: NOT CONFIGURED"
-        ((fail++))
+        fail=$((fail + 1))
     fi
 
-    # 7. PMTU discovery
-    local pmtu
-    pmtu=$(sysctl -n net.ipv4.ip_no_pmtu_disc 2>/dev/null)
-    if [[ "${pmtu}" == "1" ]]; then
-        log_ok "PMTU discovery: DISABLED"
-        ((pass++))
+    # 7. TCP MTU probing (safer than disabling PMTU entirely)
+    local mtu_probe
+    mtu_probe=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null)
+    if [[ "${mtu_probe}" == "1" || "${mtu_probe}" == "2" ]]; then
+        log_ok "TCP MTU probing: ACTIVE (safe PMTU)"
+        pass=$((pass + 1))
     else
-        log_fail "PMTU discovery: ENABLED (fingerprint risk!)"
-        ((fail++))
+        log_fail "TCP MTU probing: DISABLED"
+        fail=$((fail + 1))
     fi
 
     # 8. BBR congestion control
@@ -1134,10 +1307,10 @@ run_dpi_self_test() {
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     if [[ "${cc}" == "bbr" ]]; then
         log_ok "Congestion control: BBR"
-        ((pass++))
+        pass=$((pass + 1))
     else
         log_fail "Congestion control: ${cc} (should be bbr)"
-        ((fail++))
+        fail=$((fail + 1))
     fi
 
     # 9. Conntrack bypass
@@ -1149,10 +1322,10 @@ run_dpi_self_test() {
     fi
     if [[ "${ct_active}" == true ]]; then
         log_ok "Conntrack bypass: ACTIVE"
-        ((pass++))
+        pass=$((pass + 1))
     else
         log_fail "Conntrack bypass: INACTIVE"
-        ((fail++))
+        fail=$((fail + 1))
     fi
 
     # 10. ICMP hardening
@@ -1164,10 +1337,10 @@ run_dpi_self_test() {
     fi
     if [[ "${icmp_active}" == true ]]; then
         log_ok "ICMP hardening: ACTIVE"
-        ((pass++))
+        pass=$((pass + 1))
     else
         log_fail "ICMP hardening: INACTIVE"
-        ((fail++))
+        fail=$((fail + 1))
     fi
 
     # Summary
@@ -1244,13 +1417,25 @@ RATE_UNIT=\$(echo "\${BW}" | sed 's/[0-9]*//')
 TUNNEL_BW="\$(( RATE_NUM * 80 / 100 ))\${RATE_UNIT}"
 OTHER_BW="\$(( RATE_NUM * 20 / 100 ))\${RATE_UNIT}"
 
-# Apply HTB + fq_codel
+# Calculate burst for link speed
+BURST="256k"
+TBURST="128k"
+if [[ \${RATE_NUM} -ge 10000 ]]; then
+    BURST="10m"; TBURST="8m"
+elif [[ \${RATE_NUM} -ge 1000 ]]; then
+    BURST="2m"; TBURST="1600k"
+fi
+FQ_LIMIT=32768
+[[ \${RATE_NUM} -ge 10000 ]] && FQ_LIMIT=65536
+
+# Apply HTB + fq
 tc qdisc add dev "\${IFACE}" root handle 1: htb default 30
-tc class add dev "\${IFACE}" parent 1: classid 1:1 htb rate "\${BW}" burst 256k cburst 256k
-tc class add dev "\${IFACE}" parent 1:1 classid 1:10 htb rate "\${TUNNEL_BW}" ceil "\${BW}" burst 128k cburst 128k prio 1
-tc class add dev "\${IFACE}" parent 1:1 classid 1:30 htb rate "\${OTHER_BW}" ceil "\${BW}" burst 64k prio 3
-tc qdisc add dev "\${IFACE}" parent 1:10 handle 10: fq_codel limit 10240 target 5ms interval 100ms ecn
-tc qdisc add dev "\${IFACE}" parent 1:30 handle 30: fq 2>/dev/null || tc qdisc add dev "\${IFACE}" parent 1:30 handle 30: fq_codel
+tc class add dev "\${IFACE}" parent 1: classid 1:1 htb rate "\${BW}" burst "\${BURST}" cburst "\${BURST}"
+tc class add dev "\${IFACE}" parent 1:1 classid 1:10 htb rate "\${TUNNEL_BW}" ceil "\${BW}" burst "\${TBURST}" cburst "\${TBURST}" prio 1
+tc class add dev "\${IFACE}" parent 1:1 classid 1:30 htb rate "\${OTHER_BW}" ceil "\${BW}" burst 256k prio 3
+tc qdisc add dev "\${IFACE}" parent 1:10 handle 10: fq limit "\${FQ_LIMIT}" flow_limit 256 2>/dev/null || \
+    tc qdisc add dev "\${IFACE}" parent 1:10 handle 10: fq_codel limit "\${FQ_LIMIT}" target 5ms interval 100ms ecn
+tc qdisc add dev "\${IFACE}" parent 1:30 handle 30: fq_codel limit 10240 target 5ms interval 100ms ecn 2>/dev/null || true
 
 # Classify by mark and port
 tc filter add dev "\${IFACE}" parent 1: protocol ip handle ${XRAY_MARK} fw classid 1:10
@@ -1262,7 +1447,7 @@ tc filter add dev "\${IFACE}" parent 1: protocol ip u32 match ip sport ${PORT_VL
 # WireGuard fq
 if ip link show wg0 &>/dev/null; then
     tc qdisc replace dev wg0 root fq 2>/dev/null || true
-    ip link set wg0 txqueuelen 4000 2>/dev/null || true
+    ip link set wg0 txqueuelen 10000 2>/dev/null || true
 fi
 
 echo "[\$(date)] Anti-DPI tc rules restored" >> ${LOG_FILE}
@@ -1394,15 +1579,19 @@ apply_all() {
     tc_apply_wg_qdisc
 
     # Phase 3: Kernel parameters
-    log_header "Phase 3/5: Kernel Hardening"
+    log_header "Phase 3/6: Kernel Hardening"
     apply_sysctl_ultimate
 
-    # Phase 4: Xray patches
-    log_header "Phase 4/5: Xray Configuration"
+    # Phase 4: NIC optimization
+    log_header "Phase 4/6: NIC & Hardware Optimization"
+    apply_nic_optimization
+
+    # Phase 5: Xray patches
+    log_header "Phase 5/6: Xray Configuration"
     patch_xray_all
 
-    # Phase 5: Persistence
-    log_header "Phase 5/5: Persistence"
+    # Phase 6: Persistence
+    log_header "Phase 6/6: Persistence"
     if [[ "${FIREWALL_BACKEND}" == "nftables" ]]; then
         persist_nftables
     fi
@@ -1435,7 +1624,10 @@ show_menu() {
         echo "  ║           Anti-DPI Ultimate v${VERSION}                 ║"
         echo "  ║     Enterprise Kernel-Level DPI Evasion Engine      ║"
         echo "  ╠══════════════════════════════════════════════════════╣"
-        echo -e "  ║  Node: ${YELLOW}${NODE_ROLE:-unknown}${CYAN}  Firewall: ${YELLOW}${FIREWALL_BACKEND}${CYAN}$(printf '%*s' $((20 - ${#NODE_ROLE:-7} - ${#FIREWALL_BACKEND})) '')║"
+        local display_role="${NODE_ROLE:-unknown}"
+        local pad_len=$(( 20 - ${#display_role} - ${#FIREWALL_BACKEND} ))
+        [[ ${pad_len} -lt 1 ]] && pad_len=1
+        echo -e "  ║  Node: ${YELLOW}${display_role}${CYAN}  Firewall: ${YELLOW}${FIREWALL_BACKEND}${CYAN}$(printf '%*s' ${pad_len} '')║"
         echo "  ╠══════════════════════════════════════════════════════╣"
         echo -e "  ║  ${GREEN}1${CYAN}) Apply ALL (recommended)                         ║"
         echo -e "  ║  ${GREEN}2${CYAN}) RST Suppression                                 ║"
