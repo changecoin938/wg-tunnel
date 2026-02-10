@@ -1,0 +1,11 @@
+*.key
+*.pem
+*.crt
+pairing_token.txt
+pairing_data.json
+trojan_info.json
+vless_reality.json
+.env
+*.log
+*.bak
+.DS_Store
