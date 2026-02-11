@@ -78,6 +78,11 @@ compile() {
 
 generate_cert() {
     mkdir -p "$CONF"
+    if [[ "${REGENERATE_CERT:-0}" != "1" && -s "$CONF/cert.pem" && -s "$CONF/key.pem" ]]; then
+        chmod 600 "$CONF/key.pem" 2>/dev/null || true
+        log "$OK" "سرتیفیکیت TLS موجوده (استفاده شد). برای بازسازی: REGENERATE_CERT=1"
+        return 0
+    fi
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$CONF/key.pem" -out "$CONF/cert.pem" \
         -days 3650 -nodes \
@@ -86,13 +91,25 @@ generate_cert() {
     log "$OK" "سرتیفیکیت TLS ساخته شد"
 }
 
+get_cert_fingerprint() {
+    openssl x509 -in "$CONF/cert.pem" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//'
+}
+
 setup_server() {
-    local PSK="${1:-$(openssl rand -hex 32)}"
+    local PSK="${1:-}"
     local PORT="${2:-443}"
     local TARGET="${3:-51820}"
 
     mkdir -p "$CONF"
     generate_cert
+    local PIN=""
+    PIN="$(get_cert_fingerprint || true)"
+    [[ -n "$PIN" ]] && echo "$PIN" > "$CONF/cert.sha256" 2>/dev/null || true
+
+    if [[ -z "$PSK" && -s "$CONF/psk.txt" ]]; then
+        PSK="$(head -n1 "$CONF/psk.txt" | tr -d '\r\n')"
+    fi
+    [[ -z "$PSK" ]] && PSK="$(openssl rand -hex 32)"
     echo "$PSK" > "$CONF/psk.txt"
     chmod 600 "$CONF/psk.txt"
 
@@ -139,9 +156,14 @@ EOF
     echo -e "  IP:   ${G}${IP}${NC}"
     echo -e "  Port: ${G}${PORT}${NC}"
     echo -e "  PSK:  ${Y}${PSK}${NC}"
+    [[ -n "$PIN" ]] && echo -e "  PIN:  ${G}${PIN}${NC}"
     echo -e ""
     echo -e "  ${W}دستور نصب سرور ایران:${NC}"
-    echo -e "  sudo ./deploy.sh relay ${IP} ${PSK}"
+    if [[ -n "$PIN" ]]; then
+        echo -e "  sudo ./deploy.sh relay ${IP} ${PSK} ${PORT} ${TARGET} ${PIN}"
+    else
+        echo -e "  sudo ./deploy.sh relay ${IP} ${PSK}"
+    fi
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
@@ -150,11 +172,31 @@ setup_relay() {
     local PSK="${2:-}"
     local RPORT="${3:-443}"
     local LPORT="${4:-51820}"
+    local PIN="${5:-}"
+    local SNI="${6:-}"
 
     mkdir -p "$CONF"
+    if [[ -z "$PSK" && -s "$CONF/psk.txt" ]]; then
+        PSK="$(head -n1 "$CONF/psk.txt" | tr -d '\r\n')"
+    fi
     [[ -n "$PSK" ]] && echo "$PSK" > "$CONF/psk.txt" && chmod 600 "$CONF/psk.txt"
     local PSK_ARG=""
     [[ -n "$PSK" ]] && PSK_ARG="-f ${CONF}/psk.txt"
+
+    if [[ -z "$PIN" && -s "$CONF/pin.txt" ]]; then
+        PIN="$(head -n1 "$CONF/pin.txt" | tr -d '\r\n')"
+    fi
+    local PIN_ARG=""
+    [[ -n "$PIN" ]] && PIN_ARG="-F ${PIN}"
+
+    if [[ -z "$SNI" && -s "$CONF/sni.txt" ]]; then
+        SNI="$(head -n1 "$CONF/sni.txt" | tr -d '\r\n')"
+    fi
+    local SNI_ARG=""
+    [[ -n "$SNI" ]] && SNI_ARG="-s ${SNI}"
+
+    [[ -n "$PIN" ]] && echo "$PIN" > "$CONF/pin.txt" 2>/dev/null || true
+    [[ -n "$SNI" ]] && echo "$SNI" > "$CONF/sni.txt" 2>/dev/null || true
 
     cat > /etc/systemd/system/${SVC}.service << EOF
 [Unit]
@@ -163,7 +205,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL}/${BIN} -m client -r ${REMOTE}:${RPORT} -l ${LPORT} ${PSK_ARG} -P
+ExecStart=${INSTALL}/${BIN} -m client -r ${REMOTE}:${RPORT} -l ${LPORT} ${SNI_ARG} ${PIN_ARG} ${PSK_ARG} -P
 Restart=always
 RestartSec=10
 LimitNOFILE=65535
@@ -189,6 +231,8 @@ EOF
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  Local:  ${G}UDP :${LPORT}${NC}"
     echo -e "  Remote: ${G}TLS ${REMOTE}:${RPORT}${NC}"
+    [[ -n "$PIN" ]] && echo -e "  PIN:    ${G}${PIN}${NC}"
+    [[ -n "$SNI" ]] && echo -e "  SNI:    ${G}${SNI}${NC}"
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
     # بررسی امنیتی
@@ -238,13 +282,13 @@ banner
 
 case "${1:-}" in
     server)  check_root; check_systemd; install_deps; compile; setup_server "${2:-}" "${3:-443}" "${4:-51820}"; cleanup_traces ;;
-    relay)   check_root; check_systemd; install_deps; compile; setup_relay "${2:-}" "${3:-}" "${4:-443}" "${5:-51820}"; cleanup_traces ;;
+    relay)   check_root; check_systemd; install_deps; compile; setup_relay "${2:-}" "${3:-}" "${4:-443}" "${5:-51820}" "${6:-}" "${7:-}"; cleanup_traces ;;
     remove)  check_root; check_systemd; remove_all ;;
     status)  show_status ;;
     *)
         echo "استفاده:"
         echo "  سرور خارج:  sudo ./deploy.sh server [PSK] [PORT] [WG_PORT]"
-        echo "  سرور ایران: sudo ./deploy.sh relay FOREIGN_IP [PSK] [REMOTE_PORT] [LOCAL_PORT]"
+        echo "  سرور ایران: sudo ./deploy.sh relay FOREIGN_IP [PSK] [REMOTE_PORT] [LOCAL_PORT] [PIN] [SNI]"
         echo "  وضعیت:      sudo ./deploy.sh status"
         echo "  حذف:        sudo ./deploy.sh remove"
         echo ""

@@ -50,6 +50,7 @@
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 
 /* ─── Constants ─── */
 #define VERSION             "2.0"
@@ -105,11 +106,13 @@ typedef struct {
     int                 listen_port;
     char                remote_host[256];
     int                 remote_port;
+    char                sni_host[256];
     char                target_host[64];
     int                 target_port;
     char                cert_file[256];
     char                key_file[256];
     char                psk[65];        /* pre-shared key */
+    char                cert_pin[128];  /* SHA256 fingerprint pin (client) */
     int                 padding;        /* enable padding */
     int                 daemon_mode;
     int                 verbose;
@@ -154,6 +157,86 @@ static void log_msg(const char *level, const char *fmt, ...) {
 #define LOG_DEBUG(...)  if(g_cfg.verbose) log_msg("debug", __VA_ARGS__)
 
 static config_t g_cfg;
+
+/* ─── TLS Pinning (MITM Defense) ─── */
+
+static int hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static int parse_sha256_fingerprint(const char *s, unsigned char out[32]) {
+    if (!s) return -1;
+    int hi = -1;
+    size_t n = 0;
+    for (const char *p = s; *p; p++) {
+        int v = hex_value(*p);
+        if (v < 0) continue; /* skip ':' ' ' '=' etc */
+        if (hi < 0) {
+            hi = v;
+        } else {
+            if (n >= 32) return -1;
+            out[n++] = (unsigned char)((hi << 4) | v);
+            hi = -1;
+        }
+    }
+    if (hi >= 0) return -1;  /* odd number of hex chars */
+    return (n == 32) ? 0 : -1;
+}
+
+static void format_sha256_fingerprint(const unsigned char in[32], char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    /* "AA:BB:...": 32 bytes => 95 chars + NUL */
+    if (out_size < 96) return;
+    char *w = out;
+    for (int i = 0; i < 32; i++) {
+        snprintf(w, out_size - (size_t)(w - out), "%02X%s", in[i], (i == 31) ? "" : ":");
+        w += (i == 31) ? 2 : 3;
+    }
+    *w = '\0';
+}
+
+static int get_peer_cert_sha256(SSL *ssl, unsigned char out[32]) {
+    if (!ssl) return -1;
+    X509 *cert = SSL_get1_peer_certificate(ssl);
+    if (!cert) return -1;
+
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int mdlen = 0;
+    int ok = X509_digest(cert, EVP_sha256(), md, &mdlen);
+    X509_free(cert);
+    if (!ok || mdlen != 32) return -1;
+    memcpy(out, md, 32);
+    return 0;
+}
+
+static int verify_cert_pin(SSL *ssl) {
+    if (g_cfg.cert_pin[0] == '\0') return 1; /* no pin */
+
+    unsigned char expected[32];
+    if (parse_sha256_fingerprint(g_cfg.cert_pin, expected) != 0) {
+        LOG_ERROR("invalid -F pin format (expected SHA256 fingerprint, 32 bytes)");
+        return 0;
+    }
+
+    unsigned char actual[32];
+    if (get_peer_cert_sha256(ssl, actual) != 0) {
+        LOG_ERROR("failed to read peer certificate fingerprint");
+        return 0;
+    }
+
+    if (CRYPTO_memcmp(actual, expected, 32) != 0) {
+        char actual_str[96];
+        format_sha256_fingerprint(actual, actual_str, sizeof(actual_str));
+        LOG_ERROR("TLS cert pin mismatch. peer=%s", actual_str);
+        return 0;
+    }
+
+    return 1;
+}
 
 /* ─── Process Disguise ─── */
 
@@ -852,6 +935,10 @@ static int run_client(void) {
     SSL_CTX *ctx = create_ssl_ctx_client();
     if (!ctx) return 1;
 
+    if (g_cfg.cert_pin[0] == '\0') {
+        LOG_INFO("warning: no TLS cert pin set (-F). MITM ممکنه ترافیک رو بخونه/جایگزین کنه");
+    }
+
     /* Local UDP listener (clients connect here) */
     int udp_fd = create_udp_socket("0.0.0.0", g_cfg.listen_port);
     if (udp_fd < 0) {
@@ -877,10 +964,20 @@ static int run_client(void) {
         SSL_set_fd(ssl, tcp_fd);
 
         /* SNI — شبیه اتصال به یک سایت واقعی */
-        SSL_set_tlsext_host_name(ssl, "www.google.com");
+        if (strlen(g_cfg.sni_host) > 0)
+            SSL_set_tlsext_host_name(ssl, g_cfg.sni_host);
 
         if (SSL_connect(ssl) <= 0) {
             LOG_ERROR("TLS handshake failed");
+            SSL_free(ssl);
+            close(tcp_fd);
+            sleep(RECONNECT_DELAY);
+            continue;
+        }
+
+        if (!verify_cert_pin(ssl)) {
+            LOG_ERROR("TLS pin verification failed");
+            SSL_shutdown(ssl);
             SSL_free(ssl);
             close(tcp_fd);
             sleep(RECONNECT_DELAY);
@@ -1068,6 +1165,8 @@ static void usage(const char *prog) {
         "Client options:\n"
         "  -r HOST:PORT Remote server address\n"
         "  -l PORT      Local UDP listen port (default: 51820)\n"
+        "  -s HOST      SNI host (default: www.google.com)\n"
+        "  -F PIN       SHA256 cert fingerprint pin (recommended)\n"
         "\n"
         "Common options:\n"
         "  -p KEY       Pre-shared key for authentication\n"
@@ -1079,7 +1178,7 @@ static void usage(const char *prog) {
         "\n"
         "Examples:\n"
         "  Server: %s -m server -l 443 -t 51820 -c cert.pem -k key.pem -f /etc/cloud-agent/psk.txt -P\n"
-        "  Client: %s -m client -r 1.2.3.4:443 -l 51820 -f /etc/cloud-agent/psk.txt -P\n"
+        "  Client: %s -m client -r 1.2.3.4:443 -l 51820 -F <PIN> -f /etc/cloud-agent/psk.txt -P\n"
         "\n",
         prog, prog, prog);
 }
@@ -1091,12 +1190,13 @@ int main(int argc, char **argv) {
     g_cfg.listen_port = 443;
     g_cfg.target_port = 51820;
     g_cfg.padding = 0;
+    strncpy(g_cfg.sni_host, "www.google.com", sizeof(g_cfg.sni_host));
     strncpy(g_cfg.target_host, "127.0.0.1", sizeof(g_cfg.target_host));
     strncpy(g_cfg.cert_file, "/etc/cloud-agent/cert.pem", sizeof(g_cfg.cert_file));
     strncpy(g_cfg.key_file, "/etc/cloud-agent/key.pem", sizeof(g_cfg.key_file));
 
     int opt;
-    while ((opt = getopt(argc, argv, "m:l:t:r:c:k:p:f:Pdvh")) != -1) {
+    while ((opt = getopt(argc, argv, "m:l:t:r:s:F:c:k:p:f:Pdvh")) != -1) {
         switch (opt) {
             case 'm':
                 if (strcmp(optarg, "server") == 0) g_cfg.mode = 0;
@@ -1117,6 +1217,8 @@ int main(int argc, char **argv) {
                 }
                 break;
             }
+            case 's': strncpy(g_cfg.sni_host, optarg, sizeof(g_cfg.sni_host)-1); break;
+            case 'F': strncpy(g_cfg.cert_pin, optarg, sizeof(g_cfg.cert_pin)-1); break;
             case 'c': strncpy(g_cfg.cert_file, optarg, sizeof(g_cfg.cert_file)-1); break;
             case 'k': strncpy(g_cfg.key_file, optarg, sizeof(g_cfg.key_file)-1); break;
             case 'p': strncpy(g_cfg.psk, optarg, sizeof(g_cfg.psk)-1); break;

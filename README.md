@@ -41,16 +41,25 @@ sudo ./wg-tunnel.sh stealth server
 # (یا)
 sudo ./deploy.sh server
 
-# 2. سرور ایران (با IP و PSK از مرحله قبل)
-sudo ./wg-tunnel.sh stealth relay FOREIGN_IP PSK
+# 2. سرور ایران (با IP و PSK و PIN از مرحله قبل)
+sudo ./wg-tunnel.sh stealth relay FOREIGN_IP PSK 443 51820 PIN
 # (یا)
-sudo ./deploy.sh relay FOREIGN_IP PSK
+sudo ./deploy.sh relay FOREIGN_IP PSK 443 51820 PIN
 
 # 3. وضعیت
 sudo ./wg-tunnel.sh stealth status
 # (یا)
 sudo ./deploy.sh status
 ```
+
+## امنیت (خیلی مهم)
+
+اگر ISP/میان‌راهی بتونه **MITM** کنه (TLS رو terminate کنه)، بدون **PIN** ممکنه ترافیک خونده/جایگزین بشه.
+
+- موقع نصب سرور خارج، خروجی `deploy.sh` مقدار `PIN:` رو میده (SHA256 fingerprint).
+- همون `PIN` رو روی سرور ایران به‌عنوان آرگومان آخر به `relay` بده.
+
+اختیاری: برای طبیعی‌تر شدن TLS می‌تونی `SNI` هم بدی (آخرین آرگومان بعد از PIN).
 
 ## چرا تشخیص نمیدن؟
 

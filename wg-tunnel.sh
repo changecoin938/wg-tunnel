@@ -6,7 +6,7 @@
 #
 # Examples:
 #   sudo ./wg-tunnel.sh stealth server [PSK] [PORT] [WG_PORT]
-#   sudo ./wg-tunnel.sh stealth relay FOREIGN_IP [PSK] [REMOTE_PORT] [LOCAL_PORT]
+#   sudo ./wg-tunnel.sh stealth relay FOREIGN_IP [PSK] [REMOTE_PORT] [LOCAL_PORT] [PIN] [SNI]
 #   sudo ./wg-tunnel.sh stealth status
 #   sudo ./wg-tunnel.sh stealth remove
 #
@@ -75,37 +75,37 @@ show_main_menu() {
   cat <<'EOF'
 WG-Tunnel — Menu
 
-  1) stealth/server
-     نصب سرور خارج
+  [1] stealth/server
+      نصب سرور خارج
 
-  2) stealth/relay
-     نصب سرور ایران
+  [2] stealth/relay
+      نصب سرور ایران
 
-  3) stealth/status
-     وضعیت
+  [3] stealth/status
+      وضعیت
 
-  4) stealth/remove
-     حذف کامل
+  [4] stealth/remove
+      حذف کامل
 
-  5) enterprise
-     نصب کامل (WG + Xray)
+  [5] enterprise
+      نصب کامل (WG + Xray)
 
-  6) module/anti-dpi
-     ضد DPI (منوی تنظیمات)
+  [6] module/anti-dpi
+      ضد DPI (منوی تنظیمات)
 
-  U) module/anti-dpi-ultimate
-     ضد DPI پیشرفته (Ultimate)
+  [U] module/anti-dpi-ultimate
+      ضد DPI پیشرفته (Ultimate)
 
-  7) module/performance
-     بهینه‌سازی سرعت/پایداری
+  [7] module/performance
+      بهینه‌سازی سرعت/پایداری
 
-  8) module/stealth-guard
-     محافظ ضد شناسایی
+  [8] module/stealth-guard
+      محافظ ضد شناسایی
 
-  9) module/obfuscator
-     مبهم‌سازی ترافیک
+  [9] module/obfuscator
+      مبهم‌سازی ترافیک
 
-  0) Exit
+  [0] Exit
 EOF
   echo ""
   echo -n "Choice [0-9,U]: "
@@ -138,14 +138,20 @@ menu_loop() {
         ;;
       2)
         need_root
-        local foreign="" psk="" rport="" lport=""
+        local foreign="" psk="" rport="" lport="" pin="" sni=""
         foreign="$(prompt_required "FOREIGN_IP")" || exit 0
         echo "PSK:"
         echo "  (توصیه می‌شود. خالی = بدون PSK)"
         read -r psk || exit 0
         rport="$(prompt_default "Remote TLS Port" "443")" || exit 0
         lport="$(prompt_default "Local UDP Port" "51820")" || exit 0
-        if ! run_script "${SCRIPT_DIR}/deploy.sh" relay "${foreign}" "${psk}" "${rport}" "${lport}"; then
+        echo "PIN (SHA256 fingerprint):"
+        echo "  (خیلی توصیه می‌شود؛ از خروجی نصب سرور خارج کپی کنید. خالی = بدون پین)"
+        read -r pin || exit 0
+        echo "SNI Host:"
+        echo "  (اختیاری؛ پیش‌فرض: www.google.com)"
+        read -r sni || exit 0
+        if ! run_script "${SCRIPT_DIR}/deploy.sh" relay "${foreign}" "${psk}" "${rport}" "${lport}" "${pin}" "${sni}"; then
           echo "Install failed."
         fi
         pause
@@ -213,7 +219,7 @@ Usage:
 
 Stealth (C tunnel) wrappers:
   sudo ./wg-tunnel.sh stealth server [PSK] [PORT] [WG_PORT]
-  sudo ./wg-tunnel.sh stealth relay FOREIGN_IP [PSK] [REMOTE_PORT] [LOCAL_PORT]
+  sudo ./wg-tunnel.sh stealth relay FOREIGN_IP [PSK] [REMOTE_PORT] [LOCAL_PORT] [PIN] [SNI]
   sudo ./wg-tunnel.sh stealth status
   sudo ./wg-tunnel.sh stealth remove
 
