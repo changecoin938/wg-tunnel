@@ -75,18 +75,35 @@ show_main_menu() {
   cat <<'EOF'
 WG-Tunnel — Menu
 
-  1) Stealth: نصب سرور خارج (server)
-  2) Stealth: نصب سرور ایران (relay)
-  3) Stealth: وضعیت (status)
-  4) Stealth: حذف کامل (remove)
+  1) stealth/server
+     نصب سرور خارج
 
-  5) Enterprise Installer (WG + Xray)
+  2) stealth/relay
+     نصب سرور ایران
 
-  6) Module: Anti-DPI
-  U) Module: Anti-DPI Ultimate
-  7) Module: Performance Tuner
-  8) Module: Stealth Guard
-  9) Module: Traffic Obfuscator
+  3) stealth/status
+     وضعیت
+
+  4) stealth/remove
+     حذف کامل
+
+  5) enterprise
+     نصب کامل (WG + Xray)
+
+  6) module/anti-dpi
+     ضد DPI (منوی تنظیمات)
+
+  U) module/anti-dpi-ultimate
+     ضد DPI پیشرفته (Ultimate)
+
+  7) module/performance
+     بهینه‌سازی سرعت/پایداری
+
+  8) module/stealth-guard
+     محافظ ضد شناسایی
+
+  9) module/obfuscator
+     مبهم‌سازی ترافیک
 
   0) Exit
 EOF
@@ -109,7 +126,8 @@ menu_loop() {
       1)
         need_root
         local psk="" port="" wg_port=""
-        echo "PSK (خالی = خودکار):"
+        echo "PSK:"
+        echo "  (خالی بگذارید تا خودکار تولید شود)"
         read -r psk || exit 0
         port="$(prompt_default "TLS Port" "443")" || exit 0
         wg_port="$(prompt_default "WG UDP Port" "51820")" || exit 0
@@ -122,7 +140,8 @@ menu_loop() {
         need_root
         local foreign="" psk="" rport="" lport=""
         foreign="$(prompt_required "FOREIGN_IP")" || exit 0
-        echo "PSK (توصیه میشه) (خالی = بدون PSK):"
+        echo "PSK:"
+        echo "  (توصیه می‌شود. خالی = بدون PSK)"
         read -r psk || exit 0
         rport="$(prompt_default "Remote TLS Port" "443")" || exit 0
         lport="$(prompt_default "Local UDP Port" "51820")" || exit 0
