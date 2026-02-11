@@ -22,6 +22,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+LRM=$'\u200E' # Left-to-Right Mark (bidi helper)
+RLM=$'\u200F' # Right-to-Left Mark (bidi helper)
+
 die() {
   echo "Error: $*" >&2
   exit 1
@@ -72,43 +75,45 @@ run_script() {
 
 show_main_menu() {
   clear 2>/dev/null || true
-  cat <<'EOF'
-WG-Tunnel — Menu
+  cat <<EOF
+${LRM}WG-Tunnel${LRM}
+${RLM}منو${LRM}
 
-  [1] stealth/server
-      نصب سرور خارج
+  ${LRM}[1] stealth/server${LRM}
+      ${RLM}نصب سرور خارج${LRM}
 
-  [2] stealth/relay
-      نصب سرور ایران
+  ${LRM}[2] stealth/relay${LRM}
+      ${RLM}نصب سرور ایران${LRM}
 
-  [3] stealth/status
-      وضعیت
+  ${LRM}[3] stealth/status${LRM}
+      ${RLM}وضعیت${LRM}
 
-  [4] stealth/remove
-      حذف کامل
+  ${LRM}[4] stealth/remove${LRM}
+      ${RLM}حذف کامل${LRM}
 
-  [5] enterprise
-      نصب کامل (WG + Xray)
+  ${LRM}[5] enterprise${LRM}
+      ${RLM}نصب کامل وایرگارد و ایکس‌ری${LRM}
 
-  [6] module/anti-dpi
-      ضد DPI (منوی تنظیمات)
+  ${LRM}[6] module/anti-dpi${LRM}
+      ${RLM}ضد دی‌پی‌آی${LRM}
 
-  [U] module/anti-dpi-ultimate
-      ضد DPI پیشرفته (Ultimate)
+  ${LRM}[U] module/anti-dpi-ultimate${LRM}
+      ${RLM}ضد دی‌پی‌آی پیشرفته${LRM}
 
-  [7] module/performance
-      بهینه‌سازی سرعت/پایداری
+  ${LRM}[7] module/performance${LRM}
+      ${RLM}بهینه‌سازی سرعت و پایداری${LRM}
 
-  [8] module/stealth-guard
-      محافظ ضد شناسایی
+  ${LRM}[8] module/stealth-guard${LRM}
+      ${RLM}محافظ ضد شناسایی${LRM}
 
-  [9] module/obfuscator
-      مبهم‌سازی ترافیک
+  ${LRM}[9] module/obfuscator${LRM}
+      ${RLM}مبهم‌سازی ترافیک${LRM}
 
-  [0] Exit
+  ${LRM}[0] exit${LRM}
+      ${RLM}خروج${LRM}
 EOF
   echo ""
-  echo -n "Choice [0-9,U]: "
+  printf '%s' "${LRM}Choice [0-9,U]: ${LRM}"
 }
 
 menu_loop() {
