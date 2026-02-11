@@ -2,7 +2,7 @@
 # ============================================================================
 # wg-tunnel.sh — Unified entrypoint for WG-Tunnel repo scripts
 # ============================================================================
-# هدف: به‌جای چند اسکریپت پراکنده، یک CLI ساده برای اجرا/نصب
+# Goal: a single CLI for running/installing repo scripts
 #
 # Examples:
 #   sudo ./wg-tunnel.sh stealth server [PSK] [PORT] [WG_PORT]
@@ -22,20 +22,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-LRM=$'\u200E' # Left-to-Right Mark (bidi helper)
-RLM=$'\u200F' # Right-to-Left Mark (bidi helper)
-
 die() {
   echo "Error: $*" >&2
   exit 1
 }
 
 need_tty() {
-  [[ -t 0 ]] || die "برای منو باید داخل ترمینال اجرا کنید"
+  [[ -t 0 ]] || die "Menu requires an interactive terminal (TTY)."
 }
 
 need_root() {
-  [[ "${EUID}" -eq 0 ]] || die "این گزینه نیاز به sudo داره. مثال: sudo ./wg-tunnel.sh"
+  [[ "${EUID}" -eq 0 ]] || die "This option requires sudo. Example: sudo ./wg-tunnel.sh"
 }
 
 pause() {
@@ -75,45 +72,43 @@ run_script() {
 
 show_main_menu() {
   clear 2>/dev/null || true
-  cat <<EOF
-${LRM}WG-Tunnel${LRM}
-${RLM}منو${LRM}
+  cat <<'EOF'
+WG-Tunnel — Menu
 
-  ${LRM}[1] stealth/server${LRM}
-      ${RLM}نصب سرور خارج${LRM}
+  [1] stealth/server
+      Install exit server (foreign)
 
-  ${LRM}[2] stealth/relay${LRM}
-      ${RLM}نصب سرور ایران${LRM}
+  [2] stealth/relay
+      Install relay server (Iran)
 
-  ${LRM}[3] stealth/status${LRM}
-      ${RLM}وضعیت${LRM}
+  [3] stealth/status
+      Status
 
-  ${LRM}[4] stealth/remove${LRM}
-      ${RLM}حذف کامل${LRM}
+  [4] stealth/remove
+      Uninstall
 
-  ${LRM}[5] enterprise${LRM}
-      ${RLM}نصب کامل وایرگارد و ایکس‌ری${LRM}
+  [5] enterprise
+      Full installer (WG + Xray)
 
-  ${LRM}[6] module/anti-dpi${LRM}
-      ${RLM}ضد دی‌پی‌آی${LRM}
+  [6] module/anti-dpi
+      Anti-DPI menu
 
-  ${LRM}[U] module/anti-dpi-ultimate${LRM}
-      ${RLM}ضد دی‌پی‌آی پیشرفته${LRM}
+  [U] module/anti-dpi-ultimate
+      Anti-DPI (Ultimate)
 
-  ${LRM}[7] module/performance${LRM}
-      ${RLM}بهینه‌سازی سرعت و پایداری${LRM}
+  [7] module/performance
+      Performance tuning
 
-  ${LRM}[8] module/stealth-guard${LRM}
-      ${RLM}محافظ ضد شناسایی${LRM}
+  [8] module/stealth-guard
+      Stealth guard
 
-  ${LRM}[9] module/obfuscator${LRM}
-      ${RLM}مبهم‌سازی ترافیک${LRM}
+  [9] module/obfuscator
+      Traffic obfuscation
 
-  ${LRM}[0] exit${LRM}
-      ${RLM}خروج${LRM}
+  [0] Exit
 EOF
   echo ""
-  printf '%s' "${LRM}Choice [0-9,U]: ${LRM}"
+  echo -n "Choice [0-9,U]: "
 }
 
 menu_loop() {
@@ -132,7 +127,7 @@ menu_loop() {
         need_root
         local psk="" port="" wg_port=""
         echo "PSK:"
-        echo "  (خالی بگذارید تا خودکار تولید شود)"
+        echo "  (leave empty to auto-generate)"
         read -r psk || exit 0
         port="$(prompt_default "TLS Port" "443")" || exit 0
         wg_port="$(prompt_default "WG UDP Port" "51820")" || exit 0
@@ -146,15 +141,15 @@ menu_loop() {
         local foreign="" psk="" rport="" lport="" pin="" sni=""
         foreign="$(prompt_required "FOREIGN_IP")" || exit 0
         echo "PSK:"
-        echo "  (توصیه می‌شود. خالی = بدون PSK)"
+        echo "  (recommended. empty = no PSK)"
         read -r psk || exit 0
         rport="$(prompt_default "Remote TLS Port" "443")" || exit 0
         lport="$(prompt_default "Local UDP Port" "51820")" || exit 0
         echo "PIN (SHA256 fingerprint):"
-        echo "  (خیلی توصیه می‌شود؛ از خروجی نصب سرور خارج کپی کنید. خالی = بدون پین)"
+        echo "  (recommended. copy it from exit server output. empty = no pin)"
         read -r pin || exit 0
         echo "SNI Host:"
-        echo "  (اختیاری؛ پیش‌فرض: www.google.com)"
+        echo "  (optional; default: www.google.com)"
         read -r sni || exit 0
         if ! run_script "${SCRIPT_DIR}/deploy.sh" relay "${foreign}" "${psk}" "${rport}" "${lport}" "${pin}" "${sni}"; then
           echo "Install failed."
